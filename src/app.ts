@@ -11,6 +11,7 @@ import swaggerUi from "swagger-ui-express";
 import swaggerJsdoc from "swagger-jsdoc";
 import dotenv from "dotenv";
 import * as cbor from "cbor2";
+import cors from "cors";
 
 dotenv.config();
 
@@ -37,6 +38,7 @@ let apiServer: http.Server | null = null;
 
 const app = express();
 app.use(express.json());
+app.use(cors());
 
 const swaggerSpec = swaggerJsdoc({
   definition: {
@@ -47,11 +49,7 @@ const swaggerSpec = swaggerJsdoc({
       description:
         "API para actualizar el token de F1 y ver documentación Swagger en local.",
     },
-    servers: [
-      {
-        url: "http://0.0.0.0:3000",
-      },
-    ],
+    servers: [{ url: "/" }],
     paths: {
       "/api/config/update-token": {
         post: {
@@ -119,46 +117,28 @@ async function refreshF1Connection(): Promise<void> {
 app.post(
   "/api/config/update-token",
   async (req: Request, res: Response): Promise<Response> => {
-    const {
-      F1TVSUBSCRIPTION_TOKEN: newToken,
-      NGROK_AUTHTOKEN: newNgrokToken,
-    } = req.body;
-
-    if (
-      typeof newToken !== "string" ||
-      newToken.trim().length === 0 ||
-      typeof newNgrokToken !== "string" ||
-      newNgrokToken.trim().length === 0
-    ) {
+    const { F1TVSUBSCRIPTION_TOKEN: newToken } = req.body;
+    if (typeof newToken !== "string" || newToken.trim().length === 0) {
       return res.status(400).json({
         success: false,
-        message:
-          "F1TVSUBSCRIPTION_TOKEN and NGROK_AUTHTOKEN are required strings.",
+        message: "F1TVSUBSCRIPTION_TOKEN is required.",
       });
     }
-
     F1TV_SUBSCRIPTION_TOKEN = newToken.trim();
-    NGROK_AUTHTOKEN = newNgrokToken.trim();
-
     try {
       await refreshF1Connection();
     } catch (err) {
       console.error("[API] Token update failed:", err);
       return res.status(500).json({
         success: false,
-        message: "Failed to refresh F1 connection after updating tokens.",
+        message: "Failed to refresh F1 connection.",
         error: String(err),
       });
     }
-
-    console.log(
-      "[API] F1TVSUBSCRIPTION_TOKEN and NGROK_AUTHTOKEN updated via API.",
-    );
-
+    console.log("[API] F1TVSUBSCRIPTION_TOKEN updated via API.");
     return res.json({
       success: true,
-      message:
-        "Token y link de ngrok actualizados correctamente para este fin de semana de carrera.",
+      message: "F1TV_SUBSCRIPTION_TOKEN actualizado correctamente.",
     });
   },
 );
