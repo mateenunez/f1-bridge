@@ -5,14 +5,20 @@ import {
 } from "@microsoft/signalr";
 import { WebSocketServer } from "ws";
 import http from "http";
+import express from "express";
+import type { Request, Response } from "express";
+import swaggerUi from "swagger-ui-express";
+import swaggerJsdoc from "swagger-jsdoc";
 import dotenv from "dotenv";
 import * as cbor from "cbor2";
 
 dotenv.config();
 
 // Configuration
-const F1TV_SUBSCRIPTION_TOKEN = process.env.F1TVSUBSCRIPTION_TOKEN || "";
+let F1TV_SUBSCRIPTION_TOKEN = process.env.F1TVSUBSCRIPTION_TOKEN || "";
+let NGROK_AUTHTOKEN = process.env.NGROK_AUTHTOKEN || "";
 const BRIDGE_PORT = parseInt(process.env.BRIDGE_PORT || "5631");
+const API_PORT = 3000;
 
 let f1Connection: any = null;
 let isConnecting = false;
@@ -27,6 +33,135 @@ let fullState: FullState = {
 };
 
 let httpServer: http.Server | null = null;
+let apiServer: http.Server | null = null;
+
+const app = express();
+app.use(express.json());
+
+const swaggerSpec = swaggerJsdoc({
+  definition: {
+    openapi: "3.0.0",
+    info: {
+      title: "F1 Bridge API",
+      version: "1.0.0",
+      description:
+        "API para actualizar el token de F1 y ver documentación Swagger en local.",
+    },
+    servers: [
+      {
+        url: "http://0.0.0.0:3000",
+      },
+    ],
+    paths: {
+      "/api/config/update-token": {
+        post: {
+          tags: ["Configuration"],
+          summary:
+            "Actualiza el token de suscripción F1TV y el token/link de ngrok",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    F1TVSUBSCRIPTION_TOKEN: {
+                      type: "string",
+                      description: "Nuevo token de suscripción F1TV",
+                    },
+                  },
+                  required: ["F1TVSUBSCRIPTION_TOKEN"],
+                },
+              },
+            },
+          },
+          responses: {
+            "200": {
+              description:
+                "Token y ngrok actualizados correctamente para el fin de semana.",
+            },
+            "400": {
+              description: "Solicitud inválida.",
+            },
+            "500": {
+              description: "Error interno al actualizar los tokens.",
+            },
+          },
+        },
+      },
+    },
+  },
+  apis: [],
+});
+
+app.use("/swagger", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+
+app.get("/", (_req: Request, res: Response) => {
+  res.json({
+    message: "F1 Bridge API running",
+    swagger: "/swagger",
+  });
+});
+
+async function refreshF1Connection(): Promise<void> {
+  if (f1Connection) {
+    try {
+      await f1Connection.stop();
+    } catch (err) {
+      console.warn("[Bridge] Error stopping old F1 connection:", err);
+    }
+    f1Connection = null;
+  }
+
+  await connectToF1();
+}
+
+app.post(
+  "/api/config/update-token",
+  async (req: Request, res: Response): Promise<Response> => {
+    const {
+      F1TVSUBSCRIPTION_TOKEN: newToken,
+      NGROK_AUTHTOKEN: newNgrokToken,
+    } = req.body;
+
+    if (
+      typeof newToken !== "string" ||
+      newToken.trim().length === 0 ||
+      typeof newNgrokToken !== "string" ||
+      newNgrokToken.trim().length === 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "F1TVSUBSCRIPTION_TOKEN and NGROK_AUTHTOKEN are required strings.",
+      });
+    }
+
+    F1TV_SUBSCRIPTION_TOKEN = newToken.trim();
+    NGROK_AUTHTOKEN = newNgrokToken.trim();
+
+    try {
+      await refreshF1Connection();
+    } catch (err) {
+      console.error("[API] Token update failed:", err);
+      return res.status(500).json({
+        success: false,
+        message: "Failed to refresh F1 connection after updating tokens.",
+        error: String(err),
+      });
+    }
+
+    console.log(
+      "[API] F1TVSUBSCRIPTION_TOKEN and NGROK_AUTHTOKEN updated via API.",
+    );
+
+    return res.json({
+      success: true,
+      message:
+        "Token y link de ngrok actualizados correctamente para este fin de semana de carrera.",
+    });
+  },
+);
 
 /**
  * Connect to F1 via SignalR
@@ -270,6 +405,12 @@ function shutdown(): void {
     }
   } catch {}
 
+  try {
+    if (apiServer) {
+      apiServer.close();
+    }
+  } catch {}
+
   process.exit(0);
 }
 
@@ -280,6 +421,14 @@ initBridge().catch((err) => {
 });
 
 console.log("[Bridge] F1 TV Broadcast Bridge starting...");
+
+apiServer = app.listen(API_PORT, "0.0.0.0", () => {
+  console.log(`[API] HTTP server listening on http://0.0.0.0:${API_PORT}`);
+});
+
+apiServer?.on("error", (err: any) => {
+  console.error("[API] Server error:", err);
+});
 
 // Helper functions
 function encodeCBOR(data: any): Buffer {
