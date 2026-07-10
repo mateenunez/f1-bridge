@@ -3,8 +3,10 @@ services:
     env_file:
       - .env
     environment:
-      BRIDGE_PORT: ${BRIDGE_PORT:-9000}
-      F1TVSUBSCRIPTION_TOKEN: ${F1TVSUBSCRIPTION_TOKEN:-your_f1tv_subscription_token}
+      BRIDGE_PORT: ${BRIDGE_PORT}
+      F1TVSUBSCRIPTION_TOKEN: ${F1TVSUBSCRIPTION_TOKEN}
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
+      NGROK_DOMAIN: ${NGROK_DOMAIN}
     build:
       context: .
       dockerfile: Dockerfile
@@ -12,18 +14,6 @@ services:
     restart: always
     ports:
       - "5631:5631"
-
-  ngrok-tunnel:
-    image: ngrok/ngrok:latest
-    container_name: ngrok-service
-    restart: always
-    env_file:
-      - .env
-    environment:
-      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-your_ngrok_authtoken}
-    command:
-      - "http"
-      - "f1-bridge:5631"
-      - "--url=regulator-magazine-squealer.ngrok-free.dev"
-    depends_on:
-      - f1-bridge
+      - "3005:3005"
+    volumes:
+      - ./.env:/app/.env

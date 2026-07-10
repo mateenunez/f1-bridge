@@ -5,6 +5,9 @@ import {
 } from "@microsoft/signalr";
 import { WebSocketServer } from "ws";
 import http from "http";
+import fs from "fs";
+import path from "path";
+import { spawn, type ChildProcess } from "child_process";
 import express from "express";
 import type { Request, Response } from "express";
 import swaggerUi from "swagger-ui-express";
@@ -12,18 +15,61 @@ import swaggerJsdoc from "swagger-jsdoc";
 import dotenv from "dotenv";
 import * as cbor from "cbor2";
 import cors from "cors";
+import axios from "axios";
 
-dotenv.config();
+// override: true ensures the mounted .env file (which the update-token
+// endpoint rewrites) always wins over a stale value baked into the
+// container's env at creation time.
+dotenv.config({ override: true });
+
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value || value.trim().length === 0) {
+    console.error(`[Config] Missing required environment variable: ${name}`);
+    process.exit(1);
+  }
+  return value.trim();
+}
+
+const ENV_FILE_PATH = path.resolve(process.cwd(), ".env");
+
+/**
+ * Persist a key=value pair into the .env file, replacing the existing
+ * line for that key if present, or appending it otherwise.
+ */
+function persistEnvVar(key: string, value: string): void {
+  let content = "";
+  try {
+    content = fs.readFileSync(ENV_FILE_PATH, "utf-8");
+  } catch (err: any) {
+    if (err.code !== "ENOENT") throw err;
+  }
+
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const linePattern = new RegExp(`^${escapedKey}=.*$`, "m");
+  const newLine = `${key}=${value}`;
+
+  const updated = linePattern.test(content)
+    ? content.replace(linePattern, newLine)
+    : `${content}${content.length > 0 && !content.endsWith("\n") ? "\n" : ""}${newLine}\n`;
+
+  fs.writeFileSync(ENV_FILE_PATH, updated, "utf-8");
+}
 
 // Configuration
-let F1TV_SUBSCRIPTION_TOKEN = process.env.F1TVSUBSCRIPTION_TOKEN || "";
-let NGROK_AUTHTOKEN = process.env.NGROK_AUTHTOKEN || "";
-const BRIDGE_PORT = parseInt(process.env.BRIDGE_PORT || "5631");
-const API_PORT = 3000;
+let F1TV_SUBSCRIPTION_TOKEN = requireEnv("F1TVSUBSCRIPTION_TOKEN");
+let NGROK_AUTHTOKEN = requireEnv("NGROK_AUTHTOKEN");
+const NGROK_DOMAIN = requireEnv("NGROK_DOMAIN");
+const NGROK_BIN = process.env.NGROK_BIN_PATH || "ngrok";
+const NGROK_API_URL = "http://127.0.0.1:4040/api/tunnels";
+const BRIDGE_PORT = parseInt(requireEnv("BRIDGE_PORT"), 10);
+const API_PORT = 3005;
 
 let f1Connection: any = null;
 let isConnecting = false;
+let isRefreshingF1Connection = false;
 let wss: WebSocketServer | null = null;
+let ngrokProcess: ChildProcess | null = null;
 
 interface FullState {
   R: any;
@@ -55,7 +101,7 @@ const swaggerSpec = swaggerJsdoc({
         post: {
           tags: ["Configuration"],
           summary:
-            "Actualiza el token de suscripción F1TV y el token/link de ngrok",
+            "Actualiza el token de suscripción F1TV y lo persiste en .env",
           requestBody: {
             required: true,
             content: {
@@ -76,7 +122,7 @@ const swaggerSpec = swaggerJsdoc({
           responses: {
             "200": {
               description:
-                "Token y ngrok actualizados correctamente para el fin de semana.",
+                "Token actualizado en memoria y guardado en .env para el próximo arranque.",
             },
             "400": {
               description: "Solicitud inválida.",
@@ -102,16 +148,23 @@ app.get("/", (_req: Request, res: Response) => {
 });
 
 async function refreshF1Connection(): Promise<void> {
-  if (f1Connection) {
-    try {
-      await f1Connection.stop();
-    } catch (err) {
-      console.warn("[Bridge] Error stopping old F1 connection:", err);
+  // Suppresses the old connection's onclose handler from scheduling its
+  // own reconnect below, since stop() triggers that same close event.
+  isRefreshingF1Connection = true;
+  try {
+    if (f1Connection) {
+      try {
+        await f1Connection.stop();
+      } catch (err) {
+        console.warn("[Bridge] Error stopping old F1 connection:", err);
+      }
+      f1Connection = null;
     }
-    f1Connection = null;
-  }
 
-  await connectToF1();
+    await connectToF1();
+  } finally {
+    isRefreshingF1Connection = false;
+  }
 }
 
 app.post(
@@ -125,6 +178,18 @@ app.post(
       });
     }
     F1TV_SUBSCRIPTION_TOKEN = newToken.trim();
+
+    try {
+      persistEnvVar("F1TVSUBSCRIPTION_TOKEN", F1TV_SUBSCRIPTION_TOKEN);
+    } catch (err) {
+      console.error("[API] Failed to persist token to .env:", err);
+      return res.status(500).json({
+        success: false,
+        message: "Token updated in memory but failed to persist to .env.",
+        error: String(err),
+      });
+    }
+
     try {
       await refreshF1Connection();
     } catch (err) {
@@ -135,10 +200,13 @@ app.post(
         error: String(err),
       });
     }
-    console.log("[API] F1TVSUBSCRIPTION_TOKEN updated via API.");
+    console.log(
+      "[API] F1TVSUBSCRIPTION_TOKEN updated via API and persisted to .env.",
+    );
     return res.json({
       success: true,
-      message: "F1TV_SUBSCRIPTION_TOKEN actualizado correctamente.",
+      message:
+        "F1TV_SUBSCRIPTION_TOKEN actualizado y guardado en .env correctamente.",
     });
   },
 );
@@ -185,8 +253,23 @@ async function connectToF1(): Promise<void> {
       );
 
       connection.onclose((error: any) => {
+        // Ignore close events from a connection that's already been
+        // superseded by a newer one (e.g. a late-firing close racing
+        // with a reconnect that already succeeded).
+        if (f1Connection !== connection) {
+          console.log("[F1] Stale SignalR connection closed, ignoring.");
+          return;
+        }
+
         console.log("[F1] SignalR connection closed:", error);
         f1Connection = null;
+
+        if (isRefreshingF1Connection) {
+          // refreshF1Connection() called stop() deliberately and is about
+          // to reconnect itself; don't schedule a duplicate reconnect.
+          return;
+        }
+
         setTimeout(() => {
           initBridge().catch((err) =>
             console.error("[F1] Reconnection failed:", err.message),
@@ -229,8 +312,9 @@ async function connectToF1(): Promise<void> {
                   Object.keys(subscriptionData),
                 );
                 fullState.R = subscriptionData;
-                // Envía el dump inicial codificado a CBOR
-                broadcastToClients(encodeCBOR(fullState));
+                // Envía el dump inicial codificado a CBOR, con la misma forma
+                // (sin el wrapper "R") que reciben los clientes nuevos al conectarse.
+                broadcastToClients(encodeCBOR(fullState.R));
               }
               resolve();
             })
@@ -328,6 +412,71 @@ function startWebSocketServer(): Promise<void> {
   });
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Poll ngrok's local web inspection API until the tunnel is reported active.
+ */
+async function waitForNgrokUrl(retries = 20, delayMs = 500): Promise<string> {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const { data } = await axios.get(NGROK_API_URL);
+      const tunnel = data?.tunnels?.find((t: any) => t.proto === "https");
+      if (tunnel?.public_url) {
+        return tunnel.public_url;
+      }
+    } catch {
+      // ngrok's local API isn't up yet, keep retrying
+    }
+    await sleep(delayMs);
+  }
+  throw new Error("Timed out waiting for ngrok tunnel to become active.");
+}
+
+/**
+ * Launch the ngrok CLI as a child process so the tunnel is reachable
+ * publicly. Using the CLI binary (instead of the @ngrok/ngrok native
+ * npm SDK) keeps this working on environments like Termux, where
+ * native napi bindings are not reliably supported.
+ */
+async function startNgrokTunnel(): Promise<void> {
+  ngrokProcess = spawn(
+    NGROK_BIN,
+    ["http", String(BRIDGE_PORT), `--url=https://${NGROK_DOMAIN}`],
+    {
+      env: { ...process.env, NGROK_AUTHTOKEN },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+
+  ngrokProcess.stdout?.on("data", (chunk) =>
+    console.log(`[Ngrok] ${chunk.toString().trim()}`),
+  );
+  ngrokProcess.stderr?.on("data", (chunk) =>
+    console.error(`[Ngrok] ${chunk.toString().trim()}`),
+  );
+
+  ngrokProcess.on("error", (err: any) => {
+    if (err.code === "ENOENT") {
+      console.error(
+        `[Ngrok] Could not find the "${NGROK_BIN}" binary. Install ngrok and make sure it's on PATH, or set NGROK_BIN_PATH.`,
+      );
+    } else {
+      console.error("[Ngrok] Failed to start process:", err);
+    }
+  });
+
+  ngrokProcess.on("exit", (code, signal) => {
+    console.warn(`[Ngrok] Process exited (code=${code}, signal=${signal}).`);
+    ngrokProcess = null;
+  });
+
+  const publicUrl = await waitForNgrokUrl();
+  console.log(`[Ngrok] Tunnel established at: ${publicUrl}`);
+}
+
 /**
  * Initialize the bridge
  */
@@ -345,7 +494,12 @@ async function initBridge(): Promise<void> {
       await startWebSocketServer();
     }
 
-    // Step 2: Connect to F1 TV via SignalR
+    // Step 2: Open the ngrok tunnel
+    if (!ngrokProcess) {
+      await startNgrokTunnel();
+    }
+
+    // Step 3: Connect to F1 TV via SignalR
     if (!f1Connection || f1Connection.state !== 1) {
       // ConnectionState.Connected = 1
       await connectToF1();
@@ -370,6 +524,12 @@ function shutdown(): void {
   try {
     if (f1Connection) {
       f1Connection.stop();
+    }
+  } catch {}
+
+  try {
+    if (ngrokProcess) {
+      ngrokProcess.kill();
     }
   } catch {}
 
