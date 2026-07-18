@@ -65,6 +65,11 @@ const NGROK_API_URL = "http://127.0.0.1:4040/api/tunnels";
 const BRIDGE_PORT = parseInt(requireEnv("BRIDGE_PORT"), 10);
 const API_PORT = 3005;
 
+// F1T_API_URL / F1T_API_TOKEN are optional: without them the bridge just
+// skips notifying the API and relies on the API's own reconnect loop.
+let F1T_API_URL = (process.env.F1T_API_URL || "").trim().replace(/\/$/, "");
+let F1T_API_TOKEN = (process.env.F1T_API_TOKEN || "").trim();
+
 let f1Connection: any = null;
 let isConnecting = false;
 let isRefreshingF1Connection = false;
@@ -129,6 +134,43 @@ const swaggerSpec = swaggerJsdoc({
             },
             "500": {
               description: "Error interno al actualizar los tokens.",
+            },
+          },
+        },
+      },
+      "/api/config/update-api-token": {
+        post: {
+          tags: ["Configuration"],
+          summary:
+            "Actualiza el token admin de f1-api-ws (JWT), lo persiste en .env, y reintenta de inmediato notificarle que reintente la conexión al bridge",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    F1T_API_TOKEN: {
+                      type: "string",
+                      description:
+                        "JWT de un usuario admin de f1-api-ws (expira a los 7 días, se obtiene vía POST /users/login)",
+                    },
+                  },
+                  required: ["F1T_API_TOKEN"],
+                },
+              },
+            },
+          },
+          responses: {
+            "200": {
+              description:
+                "Token actualizado en memoria y guardado en .env; se reintentó notificar a f1-api-ws con el token nuevo.",
+            },
+            "400": {
+              description: "Solicitud inválida.",
+            },
+            "500": {
+              description: "Error interno al actualizar el token.",
             },
           },
         },
@@ -210,6 +252,74 @@ app.post(
     });
   },
 );
+
+app.post(
+  "/api/config/update-api-token",
+  async (req: Request, res: Response): Promise<Response> => {
+    const { F1T_API_TOKEN: newToken } = req.body;
+    if (typeof newToken !== "string" || newToken.trim().length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "F1T_API_TOKEN is required.",
+      });
+    }
+    F1T_API_TOKEN = newToken.trim();
+
+    try {
+      persistEnvVar("F1T_API_TOKEN", F1T_API_TOKEN);
+    } catch (err) {
+      console.error("[API] Failed to persist API token to .env:", err);
+      return res.status(500).json({
+        success: false,
+        message: "Token updated in memory but failed to persist to .env.",
+        error: String(err),
+      });
+    }
+
+    console.log("[API] F1T_API_TOKEN updated via API and persisted to .env.");
+
+    // Retry immediately with the new token instead of waiting for the next
+    // bridge restart, mirroring how update-token refreshes the F1 connection.
+    await notifyApiToReconnect();
+
+    return res.json({
+      success: true,
+      message: "F1T_API_TOKEN actualizado y guardado en .env correctamente.",
+    });
+  },
+);
+
+/**
+ * Tell f1-api-ws to reset its reconnect counter and retry connecting to
+ * this bridge, so we don't have to trigger it by hand via Swagger every
+ * time the bridge (re)starts. Best-effort: f1-api-ws has its own backoff
+ * reconnect loop as a fallback if this fails or isn't configured.
+ */
+async function notifyApiToReconnect(): Promise<void> {
+  if (!F1T_API_URL || !F1T_API_TOKEN) {
+    console.log(
+      "[Bridge] F1T_API_URL/F1T_API_TOKEN not set, skipping API reconnect notification.",
+    );
+    return;
+  }
+
+  try {
+    await axios.post(
+      `${F1T_API_URL}/admin/bridge/reset-reconnect`,
+      {},
+      {
+        headers: { Authorization: `Bearer ${F1T_API_TOKEN}` },
+        timeout: 10000,
+      },
+    );
+    console.log("[Bridge] Notified f1-api-ws to reset/reconnect to bridge.");
+  } catch (err: any) {
+    console.warn(
+      "[Bridge] Failed to notify f1-api-ws to reconnect:",
+      err?.response?.data ?? err.message,
+    );
+  }
+}
 
 /**
  * Connect to F1 via SignalR
@@ -506,6 +616,7 @@ async function initBridge(): Promise<void> {
     }
 
     console.log("[Bridge] Bridge fully initialized.");
+    await notifyApiToReconnect();
   } catch (error) {
     console.error("[Bridge] Initialization failed:", error);
     isConnecting = false;

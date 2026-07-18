@@ -7,6 +7,8 @@ services:
       F1TVSUBSCRIPTION_TOKEN: ${F1TVSUBSCRIPTION_TOKEN}
       NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
       NGROK_DOMAIN: ${NGROK_DOMAIN}
+      F1T_API_URL: ${F1T_API_URL}
+      F1T_API_TOKEN: ${F1T_API_TOKEN}
     build:
       context: .
       dockerfile: Dockerfile

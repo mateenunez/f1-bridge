@@ -13,11 +13,14 @@ Este repositorio contiene el backend del puente F1 Bridge que conecta a los clie
   - ver la documentación Swagger en `/swagger`
   - actualizar dinámicamente los tokens de F1 sin editar manualmente `.env`
 
+- Al terminar de inicializarse (WebSocket server + túnel ngrok + conexión a F1 arriba), si `F1T_API_URL` y `F1T_API_TOKEN` están configurados, llama a `POST {F1T_API_URL}/admin/bridge/reset-reconnect` en `f1-api-ws` para que se reconecte al bridge automáticamente, sin tener que hacerlo a mano desde Swagger cada vez que el bridge arranca.
+
 ## Endpoints principales
 
 - `GET /` - Responde con un mensaje básico de estado.
 - `GET /swagger` - Documentación Swagger de la API.
 - `POST /api/config/update-token` - Actualiza `F1TVSUBSCRIPTION_TOKEN` en memoria (efecto inmediato, reconecta a F1 sin reiniciar el bridge) y además reescribe la línea correspondiente en `.env`, para que el próximo arranque del bridge ya use el token nuevo sin tener que llamar al endpoint otra vez.
+- `POST /api/config/update-api-token` - Actualiza `F1T_API_TOKEN` (el JWT admin de `f1-api-ws`) en memoria, lo persiste en `.env`, y reintenta de inmediato el `POST /admin/bridge/reset-reconnect` con el token nuevo (igual que `update-token` reconecta a F1 al instante). Este JWT expira a los 7 días (se obtiene con `POST /users/login` en `f1-api-ws` usando una cuenta con rol admin), así que hay que refrescarlo periódicamente con este endpoint.
 
 ### Ejemplo de petición para actualizar token
 
@@ -53,6 +56,11 @@ F1TVSUBSCRIPTION_TOKEN=
 Opcional (no requerida, tiene default):
 
 - `NGROK_BIN_PATH`: ruta al ejecutable `ngrok` si no está en el `PATH`. Por defecto usa `ngrok`.
+
+Opcional (habilita la notificación automática a `f1-api-ws` al arrancar; si falta alguna, el bridge simplemente se salta ese paso):
+
+- `F1T_API_URL`: URL pública donde `f1-api-ws` es alcanzable (ej. `https://tu-dominio.com`), sin `/` al final.
+- `F1T_API_TOKEN`: JWT de un usuario admin de `f1-api-ws`. Expira a los 7 días; refrescalo con `POST /api/config/update-api-token`.
 
 Corriendo con Docker, `docker-compose.yml` monta `./.env` como bind mount dentro del contenedor (`/app/.env`), así que cuando `/api/config/update-token` reescribe el archivo, el cambio queda en el `.env` del host y sobrevive a un `docker compose restart` o `docker compose up` posterior.
 
