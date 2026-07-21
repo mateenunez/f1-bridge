@@ -65,6 +65,15 @@ const NGROK_API_URL = "http://127.0.0.1:4040/api/tunnels";
 const BRIDGE_PORT = parseInt(requireEnv("BRIDGE_PORT"), 10);
 const API_PORT = 3005;
 
+// How long before a session's start we should reset the F1 connection, and
+// how often to poll f1-api-ws for the time remaining. A fresh connection
+// delivers a clean initial dump (no stale data from the previous session,
+// e.g. drivers who retired), which is why we want it to land shortly before
+// each session rather than relying on whatever the bridge picked up hours
+// earlier (the bridge is often started the night before a race weekend).
+const SESSION_RESET_LEAD_MINUTES = 15;
+const SESSION_POLL_INTERVAL_MS = 10 * 60 * 1000;
+
 // F1T_API_URL / F1T_API_TOKEN are optional: without them the bridge just
 // skips notifying the API and relies on the API's own reconnect loop.
 let F1T_API_URL = (process.env.F1T_API_URL || "").trim().replace(/\/$/, "");
@@ -75,6 +84,8 @@ let isConnecting = false;
 let isRefreshingF1Connection = false;
 let wss: WebSocketServer | null = null;
 let ngrokProcess: ChildProcess | null = null;
+let lastSessionResetEventId: string | null = null;
+let warnedMissingApiUrlForSessionCheck = false;
 
 interface FullState {
   R: any;
@@ -316,6 +327,53 @@ async function notifyApiToReconnect(): Promise<void> {
   } catch (err: any) {
     console.warn(
       "[Bridge] Failed to notify f1-api-ws to reconnect:",
+      err?.response?.data ?? err.message,
+    );
+  }
+}
+
+/**
+ * Poll f1-api-ws for how long until the next session and, once we're
+ * within SESSION_RESET_LEAD_MINUTES of it, reset the F1 connection so the
+ * fresh SignalR handshake delivers a clean initial dump right before the
+ * session starts (instead of carrying over stale state from whatever the
+ * bridge picked up earlier, e.g. overnight). Only resets once per session,
+ * tracked by the upcoming event's id, since /upcoming keeps returning the
+ * same event with a shrinking countdown until it actually starts.
+ */
+async function checkUpcomingSessionAndReset(): Promise<void> {
+  if (!F1T_API_URL) {
+    if (!warnedMissingApiUrlForSessionCheck) {
+      console.log(
+        "[Bridge] F1T_API_URL not set, skipping pre-session connection reset.",
+      );
+      warnedMissingApiUrlForSessionCheck = true;
+    }
+    return;
+  }
+
+  try {
+    const { data } = await axios.get(`${F1T_API_URL}/upcoming`, {
+      timeout: 10000,
+    });
+
+    const nextEvent = data?.nextEvent;
+    const totalMinutes = data?.timeUntilNext?.totalMinutes;
+    if (!nextEvent || typeof totalMinutes !== "number") return;
+
+    if (
+      totalMinutes <= SESSION_RESET_LEAD_MINUTES &&
+      lastSessionResetEventId !== nextEvent.id
+    ) {
+      console.log(
+        `[Bridge] Session "${nextEvent.type}" at ${nextEvent.track} starts in ${totalMinutes}m, resetting F1 connection for a fresh dump.`,
+      );
+      lastSessionResetEventId = nextEvent.id;
+      await refreshF1Connection();
+    }
+  } catch (err: any) {
+    console.warn(
+      "[Bridge] Failed to check upcoming session for pre-session reset:",
       err?.response?.data ?? err.message,
     );
   }
@@ -680,6 +738,9 @@ apiServer = app.listen(API_PORT, "0.0.0.0", () => {
 apiServer?.on("error", (err: any) => {
   console.error("[API] Server error:", err);
 });
+
+checkUpcomingSessionAndReset();
+setInterval(checkUpcomingSessionAndReset, SESSION_POLL_INTERVAL_MS);
 
 // Helper functions
 function encodeCBOR(data: any): Buffer {
