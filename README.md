@@ -1,3 +1,5 @@
+[![en](https://img.shields.io/badge/lang-en-blue.svg)](https://github.com/mateenunez/f1-bridge/blob/master/README.en.md)
+[![es](https://img.shields.io/badge/lang-es-yellow.svg)](https://github.com/mateenunez/f1-bridge/blob/master/README.md)
 # F1 Bridge
 
 Este repositorio contiene el backend del puente F1 Bridge que conecta a los clientes WebSocket con los feeds de Formula 1 a través de la API de F1 TV.
@@ -9,72 +11,53 @@ Este repositorio contiene el backend del puente F1 Bridge que conecta a los clie
 - Mantiene un estado completo en memoria (`fullState.R`) para enviar a nuevos clientes WebSocket.
 - Expone un servidor WebSocket en el puerto `5631` para que otros clientes puedan consumir los datos.
 - Abre su propio túnel de ngrok apuntando a ese puerto (lanzando el binario `ngrok` como subproceso), así que no hace falta correr un contenedor ni un proceso de ngrok aparte: `docker compose up` (o `npm start`) deja el bridge y el túnel arriba juntos.
-- Expone un servidor HTTP en el puerto `3000` que permite:
-  - ver la documentación Swagger en `/swagger`
-  - actualizar dinámicamente los tokens de F1 sin editar manualmente `.env`
+- Expone un servidor HTTP en el puerto `3005` para ver Swagger en `/swagger` y el estado de los tokens en `/api/config/token-status`. Este endpoint nunca devuelve los valores secretos.
 
-- Al terminar de inicializarse (WebSocket server + túnel ngrok + conexión a F1 arriba), si `F1T_API_URL` y `F1T_API_TOKEN` están configurados, llama a `POST {F1T_API_URL}/admin/bridge/reset-reconnect` en `f1-api-ws` para que se reconecte al bridge automáticamente, sin tener que hacerlo a mano desde Swagger cada vez que el bridge arranca.
+- Al terminar de inicializarse, llama a `POST {F1T_API_URL}/admin/bridge/reset-reconnect` para que la API se reconecte automáticamente al bridge.
+- Graba las sesiones automáticamente cuando `SessionStatus` pasa a `Started` y cierra el archivo cuando pasa a `Finalised`. Qualifying se divide en archivos Q1/Q2/Q3 al cambiar `SessionData.Series`.
+- Las grabaciones son JSON Lines (`.jsonl`), compatibles con el formato que consume el replay actual; se guardan en `recordings/` (persistente en Docker).
+- Si el bridge se reinicia mientras la sesión sigue en `Started`, continúa agregando datos al archivo existente de esa sesión (incluyendo la parte actual de Qualifying). El tiempo durante el reinicio no se recupera.
+- Al cerrarse cada archivo, lo sube automáticamente a F1 Telemetry usando las credenciales de administrador de la API configuradas en el bridge.
 
 ## Endpoints principales
 
 - `GET /` - Responde con un mensaje básico de estado.
 - `GET /swagger` - Documentación Swagger de la API.
-- `POST /api/config/update-token` - Actualiza `F1TVSUBSCRIPTION_TOKEN` en memoria (efecto inmediato, reconecta a F1 sin reiniciar el bridge) y además reescribe la línea correspondiente en `.env`, para que el próximo arranque del bridge ya use el token nuevo sin tener que llamar al endpoint otra vez.
-- `POST /api/config/update-api-token` - Actualiza `F1T_API_TOKEN` (el JWT admin de `f1-api-ws`) en memoria, lo persiste en `.env`, y reintenta de inmediato el `POST /admin/bridge/reset-reconnect` con el token nuevo (igual que `update-token` reconecta a F1 al instante). Este JWT expira a los 7 días (se obtiene con `POST /users/login` en `f1-api-ws` usando una cuenta con rol admin), así que hay que refrescarlo periódicamente con este endpoint.
-
-### Ejemplo de petición para actualizar token
-
-```http
-POST http://<IP_CELULAR>:3000/api/config/update-token
-Content-Type: application/json
-
-{
-  "F1TVSUBSCRIPTION_TOKEN": "nuevo_token",
-
-}
-```
-
-## Configuración de red local
-
-El servidor HTTP escucha en `0.0.0.0:3000`, lo que permite acceder desde otros dispositivos de la misma red Wi-Fi usando la IP local del celular.
-Ejemplo: `http://192.168.x.x:3000/swagger`.
+- `GET /api/config/token-status` - Indica estado y última fecha de persistencia de cada token; nunca expone los JWT.
+- `POST /api/config/f1tv-token` - Guarda un token de F1 TV ingresado manualmente, lo persiste en `.env` y reinicia la conexión SignalR. Recibe JSON con `{"token":"..."}`; el token nunca se devuelve en la respuesta.
+- `POST /api/config/telemetry-token` - Guarda un token de F1 Telemetry, lo persiste en `.env` y notifica a la API para que reconecte. Recibe JSON con `{"token":"..."}`; el token nunca se devuelve en la respuesta.
+- `GET /api/recordings` - Lista las grabaciones locales con nombre, fecha de guardado y tamaño.
+- `GET /api/recordings/:filename` - Descarga una grabación local.
+- `PUT /api/recordings/:filename` - Sube una grabación `.jsonl` al almacenamiento local (máximo 50 MB; no sobrescribe nombres existentes).
 
 ## Variables de entorno actuales (`.env`)
 
-Todas son obligatorias: si falta alguna, el bridge lo reporta en consola y termina el proceso al iniciar (fail-fast), en vez de arrancar con un valor de relleno.
+`BRIDGE_PORT`, `NGROK_AUTHTOKEN` y `NGROK_DOMAIN` son necesarias para iniciar el bridge y el túnel. Las credenciales de F1 TV son opcionales si vas a ingresar el token manualmente desde Swagger; sin token ni credenciales, el bridge inicia pero no recibe feeds hasta que se configure un token.
 
 ```dotenv
 BRIDGE_PORT=
 NGROK_AUTHTOKEN=
 NGROK_DOMAIN=
+F1TV_EMAIL=
+F1TV_PASSWORD=
+F1TV_AUTH_MODE=automatic
+# Se puede dejar vacío y cargar manualmente desde POST /api/config/f1tv-token.
 F1TVSUBSCRIPTION_TOKEN=
+F1T_API_URL=https://api.f1telemetry.com
+F1T_API_EMAIL=
+F1T_API_PASSWORD=
+F1T_API_TOKEN=
 ```
 
 - `NGROK_AUTHTOKEN`: token de tu cuenta de ngrok.
 - `NGROK_DOMAIN`: dominio fijo de ngrok (sin esquema, ej. `tu-dominio.ngrok-free.dev`) al que se conectan los clientes por `wss://`.
+- `F1TV_EMAIL` y `F1TV_PASSWORD`: credenciales opcionales de tu cuenta F1. Si se configuran, Playwright inicia sesión al arrancar, valida el token contra Live Timing, lo guarda junto con la fecha en `.env` y lo renueva antes de su expiración (o cada 24 h si el JWT no incluye `exp`).
+- `F1TV_AUTH_MODE`: `automatic` (default) usa Playwright y requiere las credenciales anteriores para renovar automáticamente; `manual` desactiva Playwright y usa el token guardado o el endpoint manual. En Termux/Android configurá `F1TV_AUTH_MODE=manual`.
+- `F1TVSUBSCRIPTION_TOKEN`: administrado automáticamente. Si ya hay uno, se usa como fallback ante una falla temporal de login.
 
 Opcional (no requerida, tiene default):
 
 - `NGROK_BIN_PATH`: ruta al ejecutable `ngrok` si no está en el `PATH`. Por defecto usa `ngrok`.
+- `F1TV_SHOW_BROWSER`: `false` por defecto. Solo en Windows local, ponelo en `true` para ver la ventana de Chromium durante el login. En Docker y otros sistemas se ignora y Chromium se mantiene headless.
+- `F1TV_PLAYWRIGHT_EXECUTABLE_PATH`: ruta a un Chromium/Chrome instalado manualmente.
 
-Opcional (habilita la notificación automática a `f1-api-ws` al arrancar; si falta alguna, el bridge simplemente se salta ese paso):
-
-- `F1T_API_URL`: URL pública donde `f1-api-ws` es alcanzable (ej. `https://tu-dominio.com`), sin `/` al final.
-- `F1T_API_TOKEN`: JWT de un usuario admin de `f1-api-ws`. Expira a los 7 días; refrescalo con `POST /api/config/update-api-token`.
-
-Corriendo con Docker, `docker-compose.yml` monta `./.env` como bind mount dentro del contenedor (`/app/.env`), así que cuando `/api/config/update-token` reescribe el archivo, el cambio queda en el `.env` del host y sobrevive a un `docker compose restart` o `docker compose up` posterior.
-
-## Requisito: binario de ngrok
-
-El bridge lanza `ngrok` como subproceso (no usa el SDK nativo de ngrok para npm, que en Termux/Android puede fallar por sus bindings nativos). Esto significa que `ngrok` tiene que estar instalado y accesible:
-
-- **Docker**: ya viene instalado en la imagen (el `Dockerfile` lo instala vía el repo apt oficial de ngrok).
-- **Termux**: instalar el binario oficial, por ejemplo:
-  ```sh
-  pkg install wget
-  wget https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-arm64.tgz
-  tar -xvzf ngrok-v3-stable-linux-arm64.tgz
-  mv ngrok $PREFIX/bin/
-  ```
-  Confirmá que quedó en el `PATH` con `ngrok version`.
-- **Windows/Mac (desarrollo local)**: descargar el binario desde ngrok.com y dejarlo en el `PATH`, o apuntar `NGROK_BIN_PATH` a la ruta del ejecutable.

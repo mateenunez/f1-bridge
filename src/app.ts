@@ -10,16 +10,22 @@ import path from "path";
 import { spawn, type ChildProcess } from "child_process";
 import express from "express";
 import type { Request, Response } from "express";
+import type { NextFunction } from "express";
 import swaggerUi from "swagger-ui-express";
 import swaggerJsdoc from "swagger-jsdoc";
 import dotenv from "dotenv";
 import * as cbor from "cbor2";
 import cors from "cors";
 import axios from "axios";
+import { createHash, randomUUID } from "node:crypto";
+import { getF1TvSubscriptionToken } from "./f1tv-auth.js";
+import { getF1ApiToken } from "./f1-api-auth.js";
+import {
+  SessionRecorder,
+  type RecordingMetadata,
+} from "./session-recorder.js";
 
-// override: true ensures the mounted .env file (which the update-token
-// endpoint rewrites) always wins over a stale value baked into the
-// container's env at creation time.
+// The mounted .env file is the source of truth for persisted tokens.
 dotenv.config({ override: true });
 
 function requireEnv(name: string): string {
@@ -31,13 +37,29 @@ function requireEnv(name: string): string {
   return value.trim();
 }
 
+function getTokenFingerprint(token: string): string {
+  return createHash("sha256").update(token).digest("hex").slice(0, 12);
+}
+
 const ENV_FILE_PATH = path.resolve(process.cwd(), ".env");
+const RECORDINGS_DIRECTORY = path.resolve(
+  process.env.F1_RECORDINGS_DIR?.trim() || "recordings",
+);
+const MAX_RECORDING_UPLOAD_BYTES = 50 * 1024 * 1024;
+const RECORDING_FILENAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,240}\.jsonl$/;
+
+function isRecordingFilename(filename: string): boolean {
+  return (
+    filename === path.basename(filename) &&
+    RECORDING_FILENAME_PATTERN.test(filename)
+  );
+}
 
 /**
- * Persist a key=value pair into the .env file, replacing the existing
- * line for that key if present, or appending it otherwise.
+ * Persist configuration values in .env, replacing existing keys or appending
+ * missing ones.
  */
-function persistEnvVar(key: string, value: string): void {
+function persistEnvVars(values: Record<string, string>): void {
   let content = "";
   try {
     content = fs.readFileSync(ENV_FILE_PATH, "utf-8");
@@ -45,19 +67,120 @@ function persistEnvVar(key: string, value: string): void {
     if (err.code !== "ENOENT") throw err;
   }
 
-  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const linePattern = new RegExp(`^${escapedKey}=.*$`, "m");
-  const newLine = `${key}=${value}`;
+  for (const [key, value] of Object.entries(values)) {
+    const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const linePattern = new RegExp(`^${escapedKey}=.*$`, "m");
+    const newLine = `${key}=${value}`;
 
-  const updated = linePattern.test(content)
-    ? content.replace(linePattern, newLine)
-    : `${content}${content.length > 0 && !content.endsWith("\n") ? "\n" : ""}${newLine}\n`;
+    content = linePattern.test(content)
+      ? content.replace(linePattern, newLine)
+      : `${content}${content.length > 0 && !content.endsWith("\n") ? "\n" : ""}${newLine}\n`;
+  }
 
-  fs.writeFileSync(ENV_FILE_PATH, updated, "utf-8");
+  fs.writeFileSync(ENV_FILE_PATH, content, "utf-8");
+}
+
+type TokenStatus =
+  | "not_configured"
+  | "pending"
+  | "authentication_in_progress"
+  | "persisted_successfully"
+  | "authentication_failed"
+  | "refresh_failed_using_persisted_token"
+  | "persistence_failed"
+  | "manual_token_only";
+
+interface TokenState {
+  status: TokenStatus;
+  lastUpdate: string | null;
+}
+
+function getInitialTokenState(
+  token: string,
+  configuredForAutomaticLogin: boolean,
+  savedStatus: string | undefined,
+  lastUpdate: string | undefined,
+): TokenState {
+  const validStatuses: TokenStatus[] = [
+    "not_configured",
+    "pending",
+    "authentication_in_progress",
+    "persisted_successfully",
+    "authentication_failed",
+    "refresh_failed_using_persisted_token",
+    "persistence_failed",
+    "manual_token_only",
+  ];
+  const status = validStatuses.find((item) => item === savedStatus);
+
+  return {
+    status: configuredForAutomaticLogin
+      ? status ?? (token ? "persisted_successfully" : "pending")
+      : token
+        ? "manual_token_only"
+        : "not_configured",
+    lastUpdate: lastUpdate || null,
+  };
+}
+
+function persistToken(
+  tokenName: string,
+  value: string,
+  lastUpdateName: string,
+  statusName: string,
+  status: TokenStatus = "persisted_successfully",
+): string {
+  const lastUpdate = new Date().toISOString();
+  persistEnvVars({
+    [tokenName]: value,
+    [lastUpdateName]: lastUpdate,
+    [statusName]: status,
+  });
+  return lastUpdate;
+}
+
+function persistTokenStatus(name: string, status: TokenStatus): void {
+  try {
+    persistEnvVars({ [name]: status });
+  } catch (error) {
+    console.error(`[Config] Failed to persist ${name}:`, error);
+  }
 }
 
 // Configuration
-let F1TV_SUBSCRIPTION_TOKEN = requireEnv("F1TVSUBSCRIPTION_TOKEN");
+let F1TV_SUBSCRIPTION_TOKEN = (process.env.F1TVSUBSCRIPTION_TOKEN || "").trim();
+let F1TV_TOKEN_SOURCE = F1TV_SUBSCRIPTION_TOKEN ? "environment" : "unset";
+const F1TV_EMAIL = (process.env.F1TV_EMAIL || "").trim();
+const F1TV_PASSWORD = process.env.F1TV_PASSWORD || "";
+const F1TV_AUTH_MODE = (process.env.F1TV_AUTH_MODE || "automatic").trim().toLowerCase();
+if (F1TV_AUTH_MODE !== "automatic" && F1TV_AUTH_MODE !== "manual") {
+  console.error("[Config] F1TV_AUTH_MODE must be 'automatic' or 'manual'.");
+  process.exit(1);
+}
+const F1TV_PLAYWRIGHT_EXECUTABLE_PATH = (
+  process.env.F1TV_PLAYWRIGHT_EXECUTABLE_PATH || ""
+).trim();
+const hasF1TvCredentials = Boolean(F1TV_EMAIL && F1TV_PASSWORD);
+const hasF1TvAuthSource =
+  F1TV_AUTH_MODE === "automatic" && hasF1TvCredentials;
+const F1TV_SHOW_BROWSER =
+  process.platform === "win32" && process.env.F1TV_SHOW_BROWSER === "true";
+if (process.env.F1TV_SHOW_BROWSER === "true" && process.platform !== "win32") {
+  console.warn(
+    "[F1] F1TV_SHOW_BROWSER is supported only when running locally on Windows; using headless Chromium.",
+  );
+}
+if (F1TV_AUTH_MODE === "automatic" && Boolean(F1TV_EMAIL) !== Boolean(F1TV_PASSWORD)) {
+  console.error("[Config] F1TV_EMAIL and F1TV_PASSWORD must both be configured.");
+  process.exit(1);
+}
+if (F1TV_AUTH_MODE === "manual") {
+  console.log("[F1] Manual token mode enabled; Playwright login is disabled.");
+} else if (!hasF1TvCredentials) {
+  console.warn(
+    "[F1] Automatic login is not configured; use POST /api/config/f1tv-token to supply a token.",
+  );
+}
 let NGROK_AUTHTOKEN = requireEnv("NGROK_AUTHTOKEN");
 const NGROK_DOMAIN = requireEnv("NGROK_DOMAIN");
 const NGROK_BIN = process.env.NGROK_BIN_PATH || "ngrok";
@@ -78,6 +201,30 @@ const SESSION_POLL_INTERVAL_MS = 10 * 60 * 1000;
 // skips notifying the API and relies on the API's own reconnect loop.
 let F1T_API_URL = (process.env.F1T_API_URL || "").trim().replace(/\/$/, "");
 let F1T_API_TOKEN = (process.env.F1T_API_TOKEN || "").trim();
+const F1T_API_EMAIL = (process.env.F1T_API_EMAIL || "").trim();
+const F1T_API_PASSWORD = process.env.F1T_API_PASSWORD || "";
+if (Boolean(F1T_API_EMAIL) !== Boolean(F1T_API_PASSWORD)) {
+  console.error(
+    "[Config] F1T_API_EMAIL and F1T_API_PASSWORD must both be configured.",
+  );
+  process.exit(1);
+}
+if ((F1T_API_EMAIL || F1T_API_PASSWORD) && !F1T_API_URL) {
+  console.error("[Config] F1T_API_URL is required for automatic API login.");
+  process.exit(1);
+}
+const f1TvTokenState = getInitialTokenState(
+  F1TV_SUBSCRIPTION_TOKEN,
+  hasF1TvAuthSource,
+  process.env.F1TVSUBSCRIPTION_TOKEN_STATUS,
+  process.env.F1TVSUBSCRIPTION_TOKEN_LAST_UPDATE,
+);
+const telemetryTokenState = getInitialTokenState(
+  F1T_API_TOKEN,
+  Boolean(F1T_API_EMAIL && F1T_API_PASSWORD && F1T_API_URL),
+  process.env.F1TELEMETRY_TOKEN_STATUS,
+  process.env.F1TELEMETRY_TOKEN_LAST_UPDATE,
+);
 
 let f1Connection: any = null;
 let isConnecting = false;
@@ -86,6 +233,12 @@ let wss: WebSocketServer | null = null;
 let ngrokProcess: ChildProcess | null = null;
 let lastSessionResetEventId: string | null = null;
 let warnedMissingApiUrlForSessionCheck = false;
+let f1TvAuthInitialized = false;
+let f1TvManualOverride = false;
+let f1TvRefreshTimer: NodeJS.Timeout | null = null;
+let f1ApiAuthInitialized = false;
+let f1ApiManualOverride = false;
+let f1ApiRefreshTimer: NodeJS.Timeout | null = null;
 
 interface FullState {
   R: any;
@@ -94,6 +247,10 @@ interface FullState {
 let fullState: FullState = {
   R: {},
 };
+const sessionRecorder = new SessionRecorder(
+  process.env.F1_RECORDINGS_DIR?.trim(),
+  uploadClosedRecording,
+);
 
 let httpServer: http.Server | null = null;
 let apiServer: http.Server | null = null;
@@ -109,80 +266,182 @@ const swaggerSpec = swaggerJsdoc({
       title: "F1 Bridge API",
       version: "1.0.0",
       description:
-        "API para actualizar el token de F1 y ver documentación Swagger en local.",
+        "API HTTP del F1 Bridge, disponible en el puerto 3005. La lista completa de grabaciones no tiene paginación.",
     },
-    servers: [{ url: "/" }],
+    servers: [{ url: "/", description: "Puerto HTTP 3005 del F1 Bridge" }],
     paths: {
-      "/api/config/update-token": {
-        post: {
+      "/api/config/token-status": {
+        get: {
           tags: ["Configuration"],
-          summary:
-            "Actualiza el token de suscripción F1TV y lo persiste en .env",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    F1TVSUBSCRIPTION_TOKEN: {
-                      type: "string",
-                      description: "Nuevo token de suscripción F1TV",
-                    },
-                  },
-                  required: ["F1TVSUBSCRIPTION_TOKEN"],
-                },
-              },
-            },
-          },
+          summary: "Consulta estado y fecha de persistencia de los tokens",
           responses: {
             "200": {
-              description:
-                "Token actualizado en memoria y guardado en .env para el próximo arranque.",
-            },
-            "400": {
-              description: "Solicitud inválida.",
-            },
-            "500": {
-              description: "Error interno al actualizar los tokens.",
+              description: "Estado y fechas; no incluye los valores de tokens.",
             },
           },
         },
       },
-      "/api/config/update-api-token": {
+      "/api/config/f1tv-token": {
         post: {
           tags: ["Configuration"],
-          summary:
-            "Actualiza el token admin de f1-api-ws (JWT), lo persiste en .env, y reintenta de inmediato notificarle que reintente la conexión al bridge",
+          summary: "Guarda manualmente el token de suscripción de F1 TV y reinicia la conexión",
           requestBody: {
             required: true,
             content: {
               "application/json": {
                 schema: {
                   type: "object",
+                  required: ["token"],
                   properties: {
-                    F1T_API_TOKEN: {
+                    token: {
                       type: "string",
-                      description:
-                        "JWT de un usuario admin de f1-api-ws (expira a los 7 días, se obtiene vía POST /users/login)",
+                      description: "Token de suscripción de F1 TV. No se devuelve en la respuesta.",
                     },
                   },
-                  required: ["F1T_API_TOKEN"],
                 },
               },
             },
           },
           responses: {
+            "200": { description: "Token guardado y conexión con F1 restablecida." },
+            "400": { description: "El token es obligatorio." },
+            "500": { description: "No se pudo persistir el token." },
+            "502": { description: "El token se guardó, pero no se pudo restablecer la conexión." },
+          },
+        },
+      },
+      "/api/config/telemetry-token": {
+        post: {
+          tags: ["Configuration"],
+          summary: "Guarda manualmente el token de F1 Telemetry",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["token"],
+                  properties: {
+                    token: {
+                      type: "string",
+                      description: "Token de F1 Telemetry. No se devuelve en la respuesta.",
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            "200": { description: "Token guardado; se notificó a la API para reconectar." },
+            "400": { description: "El token es obligatorio." },
+            "500": { description: "No se pudo persistir el token." },
+          },
+        },
+      },
+      "/api/recordings": {
+        get: {
+          tags: ["Recordings"],
+          summary: "Lista todas las grabaciones locales, sin paginación",
+          description:
+            "Devuelve todas las sesiones locales. No requiere token; limita el acceso a una red de confianza.",
+          responses: {
             "200": {
-              description:
-                "Token actualizado en memoria y guardado en .env; se reintentó notificar a f1-api-ws con el token nuevo.",
+              description: "Lista completa, ordenada desde la grabación más reciente.",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    required: ["success", "recordings"],
+                    properties: {
+                      success: { type: "boolean", example: true },
+                      recordings: {
+                        type: "array",
+                        items: {
+                          type: "object",
+                          required: ["filename", "savedAt", "sizeBytes"],
+                          properties: {
+                            filename: {
+                              type: "string",
+                              example: "2026-77-race.jsonl",
+                            },
+                            savedAt: {
+                              type: "string",
+                              format: "date-time",
+                              example: "2026-10-31T13:31:45.620Z",
+                            },
+                            sizeBytes: {
+                              type: "integer",
+                              example: 9158656,
+                            },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
             },
-            "400": {
-              description: "Solicitud inválida.",
+          },
+        },
+      },
+      "/api/recordings/{filename}": {
+        get: {
+          tags: ["Recordings"],
+          summary: "Descarga una grabación local",
+          description:
+            "No requiere token. Limita el acceso al bridge a una red de confianza.",
+          parameters: [
+            {
+              name: "filename",
+              in: "path",
+              required: true,
+              schema: {
+                type: "string",
+                pattern: RECORDING_FILENAME_PATTERN.source,
+              },
             },
-            "500": {
-              description: "Error interno al actualizar el token.",
+          ],
+          responses: {
+            "200": {
+              description: "Archivo JSON Lines",
+              content: {
+                "application/x-ndjson": {
+                  schema: { type: "string", format: "binary" },
+                },
+              },
             },
+            "404": { description: "Archivo inexistente" },
+          },
+        },
+        put: {
+          tags: ["Recordings"],
+          summary: "Sube una grabación JSON Lines al almacenamiento local",
+          description:
+            "No requiere token. Límite de 50 MB. No sobrescribe archivos existentes. Las sesiones grabadas automáticamente se suben a la API de F1 Telemetry al finalizar.",
+          parameters: [
+            {
+              name: "filename",
+              in: "path",
+              required: true,
+              schema: {
+                type: "string",
+                pattern: RECORDING_FILENAME_PATTERN.source,
+              },
+            },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              "application/x-ndjson": {
+                schema: { type: "string", format: "binary" },
+              },
+            },
+          },
+          responses: {
+            "201": { description: "Grabación guardada localmente" },
+            "400": { description: "Archivo vacío o nombre inválido" },
+            "409": { description: "Ya existe una grabación con ese nombre" },
+            "413": { description: "La grabación supera 50 MB" },
           },
         },
       },
@@ -191,14 +450,340 @@ const swaggerSpec = swaggerJsdoc({
   apis: [],
 });
 
+const parseRecordingUpload = express.raw({
+  type: "application/x-ndjson",
+  limit: MAX_RECORDING_UPLOAD_BYTES,
+});
+
+app.put(
+  "/api/recordings/:filename",
+  (req: Request, res: Response, next: NextFunction) => {
+    parseRecordingUpload(req, res, (error?: unknown) => {
+      if (!error) {
+        next();
+        return;
+      }
+
+      const status =
+        typeof error === "object" &&
+        error !== null &&
+        "status" in error &&
+        typeof error.status === "number"
+          ? error.status
+          : 400;
+      if (status === 413) {
+        res.status(413).json({
+          success: false,
+          error: "Recording exceeds the 50 MB upload limit.",
+        });
+        return;
+      }
+
+      next(error);
+    });
+  },
+  async (req: Request, res: Response) => {
+    const filename = req.params.filename;
+    if (typeof filename !== "string" || !isRecordingFilename(filename)) {
+      res.status(400).json({ success: false, error: "Invalid recording filename." });
+      return;
+    }
+
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+      res.status(400).json({ success: false, error: "Recording body is required." });
+      return;
+    }
+
+    const filePath = path.join(RECORDINGS_DIRECTORY, filename);
+    const temporaryPath = path.join(
+      RECORDINGS_DIRECTORY,
+      `.${filename}.${randomUUID()}.tmp`,
+    );
+
+    try {
+      await fs.promises.mkdir(RECORDINGS_DIRECTORY, { recursive: true });
+      await fs.promises.writeFile(temporaryPath, req.body, { flag: "wx" });
+      await fs.promises.copyFile(
+        temporaryPath,
+        filePath,
+        fs.constants.COPYFILE_EXCL,
+      );
+      await fs.promises.rm(temporaryPath, { force: true });
+      const stats = await fs.promises.stat(filePath);
+      res.status(201).json({
+        success: true,
+        filename,
+        savedAt: stats.mtime.toISOString(),
+        sizeBytes: stats.size,
+      });
+    } catch (error) {
+      await fs.promises.rm(temporaryPath, { force: true }).catch((cleanupError) => {
+        console.error("[Recorder] Failed to remove temporary upload:", cleanupError);
+      });
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        res.status(409).json({
+          success: false,
+          error: "A recording with that filename already exists.",
+        });
+        return;
+      }
+      console.error(`[Recorder] Failed to save uploaded recording ${filename}:`, error);
+      res.status(500).json({
+        success: false,
+        error: "Could not save uploaded recording.",
+      });
+    }
+  },
+);
+
 app.use("/swagger", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
 app.get("/", (_req: Request, res: Response) => {
   res.json({
     message: "F1 Bridge API running",
     swagger: "/swagger",
+    tokenStatus: "/api/config/token-status",
+    setF1TvToken: "/api/config/f1tv-token",
+    setTelemetryToken: "/api/config/telemetry-token",
+    recordings: "/api/recordings",
   });
 });
+
+app.get(
+  "/api/recordings",
+  async (_req: Request, res: Response) => {
+    try {
+    await fs.promises.mkdir(RECORDINGS_DIRECTORY, { recursive: true });
+    const entries = await fs.promises.readdir(RECORDINGS_DIRECTORY, {
+        withFileTypes: true,
+      });
+      const recordings = await Promise.all(
+        entries
+          .filter(
+            (entry) => entry.isFile() && isRecordingFilename(entry.name),
+          )
+          .map(async (entry) => {
+            const stats = await fs.promises.stat(
+              path.join(RECORDINGS_DIRECTORY, entry.name),
+            );
+            return {
+              filename: entry.name,
+              savedAt: stats.mtime.toISOString(),
+              sizeBytes: stats.size,
+            };
+          }),
+      );
+
+      recordings.sort((left, right) => right.savedAt.localeCompare(left.savedAt));
+      res.json({ success: true, recordings });
+    } catch (error) {
+      console.error("[Recorder] Failed to list recordings:", error);
+      res.status(500).json({
+        success: false,
+        error: "Could not list recordings.",
+      });
+    }
+  },
+);
+
+app.get(
+  "/api/recordings/:filename",
+  (req: Request, res: Response) => {
+    const filename = req.params.filename;
+    if (typeof filename !== "string" || !isRecordingFilename(filename)) {
+      res.status(404).json({ success: false, error: "Recording not found." });
+      return;
+    }
+
+    res.download(
+      path.join(RECORDINGS_DIRECTORY, filename),
+      filename,
+      (error) => {
+        if (!error) return;
+        if (res.headersSent) {
+          res.destroy(error);
+          return;
+        }
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          res.status(404).json({ success: false, error: "Recording not found." });
+          return;
+        }
+        console.error(`[Recorder] Failed to download ${filename}:`, error);
+        res.status(500).json({
+          success: false,
+          error: "Could not download recording.",
+        });
+      },
+    );
+  },
+);
+
+app.get("/api/config/token-status", (_req: Request, res: Response) => {
+  res.json({
+    F1TVSUBSCRIPTION_TOKEN: { ...f1TvTokenState },
+    F1TELEMETRY_TOKEN: { ...telemetryTokenState },
+  });
+});
+
+app.post("/api/config/telemetry-token", async (req: Request, res: Response) => {
+  const token = typeof req.body?.token === "string" ? req.body.token.trim() : "";
+  if (!token) {
+    res.status(400).json({ error: "El campo token es obligatorio." });
+    return;
+  }
+
+  let lastUpdate: string;
+  try {
+    lastUpdate = persistToken(
+      "F1T_API_TOKEN",
+      token,
+      "F1TELEMETRY_TOKEN_LAST_UPDATE",
+      "F1TELEMETRY_TOKEN_STATUS",
+      "manual_token_only",
+    );
+  } catch (error) {
+    console.error("[F1 API] Failed to persist manually supplied token:", error);
+    res.status(500).json({ error: "No se pudo guardar el token de F1 Telemetry." });
+    return;
+  }
+
+  F1T_API_TOKEN = token;
+  f1ApiManualOverride = true;
+  telemetryTokenState.lastUpdate = lastUpdate;
+  telemetryTokenState.status = "manual_token_only";
+  if (f1ApiRefreshTimer) {
+    clearTimeout(f1ApiRefreshTimer);
+    f1ApiRefreshTimer = null;
+  }
+
+  await notifyApiToReconnect();
+  res.json({
+    message: "Token de F1 Telemetry guardado.",
+    status: telemetryTokenState.status,
+    lastUpdate,
+  });
+});
+
+app.post("/api/config/f1tv-token", async (req: Request, res: Response) => {
+  const token = typeof req.body?.token === "string" ? req.body.token.trim() : "";
+  if (!token) {
+    res.status(400).json({ error: "El campo token es obligatorio." });
+    return;
+  }
+
+  let lastUpdate: string;
+  try {
+    lastUpdate = persistToken(
+      "F1TVSUBSCRIPTION_TOKEN",
+      token,
+      "F1TVSUBSCRIPTION_TOKEN_LAST_UPDATE",
+      "F1TVSUBSCRIPTION_TOKEN_STATUS",
+      "manual_token_only",
+    );
+  } catch (error) {
+    console.error("[F1] Failed to persist manually supplied subscription token:", error);
+    res.status(500).json({ error: "No se pudo guardar el token de F1 TV." });
+    return;
+  }
+
+  F1TV_SUBSCRIPTION_TOKEN = token;
+  f1TvManualOverride = true;
+  F1TV_TOKEN_SOURCE = "manual-api";
+  f1TvTokenState.lastUpdate = lastUpdate;
+  f1TvTokenState.status = "manual_token_only";
+  if (f1TvRefreshTimer) {
+    clearTimeout(f1TvRefreshTimer);
+    f1TvRefreshTimer = null;
+  }
+
+  try {
+    if (f1Connection) {
+      await refreshF1Connection();
+    } else {
+      await initBridge();
+      if (!f1Connection) {
+        throw new Error("F1 connection was not established.");
+      }
+    }
+
+    res.json({
+      message: "Token guardado y conexión con F1 restablecida.",
+      status: f1TvTokenState.status,
+      lastUpdate,
+    });
+  } catch (error) {
+    console.error(
+      "[F1] Manual token was saved, but the F1 connection could not be restored:",
+      error instanceof Error ? error.name : "Unknown error",
+    );
+    res.status(502).json({
+      error: "El token se guardó, pero no se pudo restablecer la conexión con F1.",
+      tokenSaved: true,
+      status: f1TvTokenState.status,
+      lastUpdate,
+    });
+  }
+});
+
+async function uploadClosedRecording(
+  filePath: string,
+  metadata: RecordingMetadata,
+): Promise<void> {
+  if (process.env.F1T_RECORDINGS_AUTO_UPLOAD === "false") {
+    console.log("[Recorder] Automatic upload disabled; recording remains local.");
+    return;
+  }
+  if (!F1T_API_URL || !F1T_API_TOKEN) {
+    console.warn(
+      "[Recorder] Recording remains local; configure the F1 Telemetry API admin token to upload it.",
+    );
+    return;
+  }
+
+  const filename = path.basename(filePath);
+  if (!isRecordingFilename(filename)) {
+    throw new Error("Recording filename is not valid for upload.");
+  }
+
+  const stats = await fs.promises.stat(filePath);
+  if (stats.size > MAX_RECORDING_UPLOAD_BYTES) {
+    throw new Error(
+      `Recording is ${stats.size} bytes; the API upload limit is ${MAX_RECORDING_UPLOAD_BYTES} bytes.`,
+    );
+  }
+
+  const sessionId = filename.slice(0, -".jsonl".length);
+  const uploadUrl = `${F1T_API_URL}/admin/recordings/${encodeURIComponent(sessionId)}`;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await axios.put(uploadUrl, fs.createReadStream(filePath), {
+        params: {
+          sessionName: metadata.sessionName ?? undefined,
+          sessionType: metadata.sessionType ?? undefined,
+        },
+        headers: {
+          Authorization: `Bearer ${F1T_API_TOKEN}`,
+          "Content-Type": "application/x-ndjson",
+          "Content-Length": stats.size,
+        },
+        maxBodyLength: MAX_RECORDING_UPLOAD_BYTES,
+        timeout: 120_000,
+      });
+      console.log(`[Recorder] Uploaded recording to API: ${filename}`);
+      return;
+    } catch (error) {
+      lastError = error;
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      const isRetryable = status === undefined || status === 429 || status >= 500;
+      if (!isRetryable || attempt === 3) break;
+      await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
+    }
+  }
+
+  console.error(`[Recorder] Could not upload ${filename}; local copy retained:`, lastError);
+}
 
 async function refreshF1Connection(): Promise<void> {
   // Suppresses the old connection's onclose handler from scheduling its
@@ -220,85 +805,223 @@ async function refreshF1Connection(): Promise<void> {
   }
 }
 
-app.post(
-  "/api/config/update-token",
-  async (req: Request, res: Response): Promise<Response> => {
-    const { F1TVSUBSCRIPTION_TOKEN: newToken } = req.body;
-    if (typeof newToken !== "string" || newToken.trim().length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "F1TVSUBSCRIPTION_TOKEN is required.",
-      });
+function getJwtExpiry(token: string): number | null {
+  const payload = token.split(".")[1];
+  if (!payload) return null;
+
+  try {
+    const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    return typeof claims.exp === "number" ? claims.exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+function scheduleF1TvTokenRefresh(token: string): void {
+  if (f1TvRefreshTimer) clearTimeout(f1TvRefreshTimer);
+
+  if (!F1TV_EMAIL || !F1TV_PASSWORD) return;
+
+  const expiry = getJwtExpiry(token) ?? Date.now() + 24 * 60 * 60 * 1000;
+  const refreshDelay = Math.max(60000, expiry - Date.now() - 5 * 60 * 1000);
+  f1TvRefreshTimer = setTimeout(async () => {
+    try {
+      await refreshF1TvSubscriptionToken();
+    } catch (error) {
+      console.error("[F1] Automatic token refresh failed:", error);
+      scheduleF1TvTokenRetry();
     }
-    F1TV_SUBSCRIPTION_TOKEN = newToken.trim();
+  }, refreshDelay);
+  f1TvRefreshTimer.unref();
+}
+
+function scheduleF1ApiTokenRefresh(token: string): void {
+  if (f1ApiRefreshTimer) clearTimeout(f1ApiRefreshTimer);
+  if (!F1T_API_EMAIL || !F1T_API_PASSWORD) return;
+
+  const expiry = getJwtExpiry(token) ?? Date.now() + 24 * 60 * 60 * 1000;
+
+  f1ApiRefreshTimer = setTimeout(async () => {
+    try {
+      await refreshF1ApiToken(true);
+    } catch (error) {
+      console.error("[F1 API] Automatic token refresh failed:", error);
+      scheduleF1ApiTokenRetry();
+    }
+  }, Math.max(60000, expiry - Date.now() - 5 * 60 * 1000));
+  f1ApiRefreshTimer.unref();
+}
+
+function scheduleF1ApiTokenRetry(): void {
+  f1ApiRefreshTimer = setTimeout(async () => {
+    try {
+      await refreshF1ApiToken(true);
+    } catch (error) {
+      console.error("[F1 API] Automatic token refresh retry failed:", error);
+      scheduleF1ApiTokenRetry();
+    }
+  }, 5 * 60 * 1000);
+  f1ApiRefreshTimer.unref();
+}
+
+async function refreshF1ApiToken(notifyApi = false): Promise<void> {
+  telemetryTokenState.status = "authentication_in_progress";
+  let persistenceFailed = false;
+  try {
+    const token = await getF1ApiToken({
+      baseUrl: F1T_API_URL,
+      email: F1T_API_EMAIL,
+      password: F1T_API_PASSWORD,
+    });
 
     try {
-      persistEnvVar("F1TVSUBSCRIPTION_TOKEN", F1TV_SUBSCRIPTION_TOKEN);
-    } catch (err) {
-      console.error("[API] Failed to persist token to .env:", err);
-      return res.status(500).json({
-        success: false,
-        message: "Token updated in memory but failed to persist to .env.",
-        error: String(err),
-      });
+      telemetryTokenState.lastUpdate = persistToken(
+        "F1T_API_TOKEN",
+        token,
+        "F1TELEMETRY_TOKEN_LAST_UPDATE",
+        "F1TELEMETRY_TOKEN_STATUS",
+      );
+    } catch (error) {
+      persistenceFailed = true;
+      telemetryTokenState.status = "persistence_failed";
+      persistTokenStatus("F1TELEMETRY_TOKEN_STATUS", telemetryTokenState.status);
+      throw error;
     }
 
-    try {
-      await refreshF1Connection();
-    } catch (err) {
-      console.error("[API] Token update failed:", err);
-      return res.status(500).json({
-        success: false,
-        message: "Failed to refresh F1 connection.",
-        error: String(err),
-      });
+    F1T_API_TOKEN = token;
+    telemetryTokenState.status = "persisted_successfully";
+    scheduleF1ApiTokenRefresh(token);
+    console.log("[F1 API] Login token refreshed and saved.");
+
+    if (notifyApi) await notifyApiToReconnect();
+  } catch (error) {
+    if (!persistenceFailed) {
+      telemetryTokenState.status = F1T_API_TOKEN
+        ? "refresh_failed_using_persisted_token"
+        : "authentication_failed";
+      persistTokenStatus("F1TELEMETRY_TOKEN_STATUS", telemetryTokenState.status);
     }
+    throw error;
+  }
+}
+
+async function initializeF1ApiAuth(): Promise<void> {
+  if (
+    f1ApiManualOverride ||
+    f1ApiAuthInitialized ||
+    !F1T_API_EMAIL ||
+    !F1T_API_PASSWORD
+  ) {
+    return;
+  }
+
+  try {
+    await refreshF1ApiToken();
+  } catch (error) {
+    if (F1T_API_TOKEN) {
+      console.error(
+        "[F1 API] Automatic login failed; continuing with the existing F1T_API_TOKEN:",
+        error,
+      );
+    } else {
+      console.error("[F1 API] Automatic login failed; will retry in five minutes:", error);
+    }
+    scheduleF1ApiTokenRetry();
+  }
+
+  f1ApiAuthInitialized = true;
+}
+
+function scheduleF1TvTokenRetry(): void {
+  f1TvRefreshTimer = setTimeout(async () => {
+    try {
+      await refreshF1TvSubscriptionToken();
+    } catch (error) {
+      console.error("[F1] Automatic token refresh retry failed:", error);
+      scheduleF1TvTokenRetry();
+    }
+  }, 5 * 60 * 1000);
+  f1TvRefreshTimer.unref();
+}
+
+async function refreshF1TvSubscriptionToken(): Promise<void> {
+  f1TvTokenState.status = "authentication_in_progress";
+  let token: string;
+  let tokenSource: string;
+  let persistenceFailed = false;
+  try {
+    const tokenResult = await getF1TvSubscriptionToken({
+      email: F1TV_EMAIL,
+      password: F1TV_PASSWORD,
+      ...(F1TV_PLAYWRIGHT_EXECUTABLE_PATH
+        ? { executablePath: F1TV_PLAYWRIGHT_EXECUTABLE_PATH }
+        : {}),
+      headless: !F1TV_SHOW_BROWSER,
+    });
+    token = tokenResult.token;
+    tokenSource = tokenResult.source;
     console.log(
-      "[API] F1TVSUBSCRIPTION_TOKEN updated via API and persisted to .env.",
+      `[F1] Playwright selected token fingerprint=${getTokenFingerprint(token)} length=${token.length} source=${tokenSource || "unknown"}.`,
     );
-    return res.json({
-      success: true,
-      message:
-        "F1TV_SUBSCRIPTION_TOKEN actualizado y guardado en .env correctamente.",
-    });
-  },
-);
-
-app.post(
-  "/api/config/update-api-token",
-  async (req: Request, res: Response): Promise<Response> => {
-    const { F1T_API_TOKEN: newToken } = req.body;
-    if (typeof newToken !== "string" || newToken.trim().length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "F1T_API_TOKEN is required.",
-      });
-    }
-    F1T_API_TOKEN = newToken.trim();
 
     try {
-      persistEnvVar("F1T_API_TOKEN", F1T_API_TOKEN);
-    } catch (err) {
-      console.error("[API] Failed to persist API token to .env:", err);
-      return res.status(500).json({
-        success: false,
-        message: "Token updated in memory but failed to persist to .env.",
-        error: String(err),
-      });
+      f1TvTokenState.lastUpdate = persistToken(
+        "F1TVSUBSCRIPTION_TOKEN",
+        token,
+        "F1TVSUBSCRIPTION_TOKEN_LAST_UPDATE",
+        "F1TVSUBSCRIPTION_TOKEN_STATUS",
+      );
+    } catch (error) {
+      persistenceFailed = true;
+      f1TvTokenState.status = "persistence_failed";
+      persistTokenStatus(
+        "F1TVSUBSCRIPTION_TOKEN_STATUS",
+        f1TvTokenState.status,
+      );
+      throw error;
     }
+  } catch (error) {
+    if (!persistenceFailed) {
+      f1TvTokenState.status = F1TV_SUBSCRIPTION_TOKEN
+        ? "refresh_failed_using_persisted_token"
+        : "authentication_failed";
+      persistTokenStatus(
+        "F1TVSUBSCRIPTION_TOKEN_STATUS",
+        f1TvTokenState.status,
+      );
+    }
+    throw error;
+  }
 
-    console.log("[API] F1T_API_TOKEN updated via API and persisted to .env.");
+  F1TV_SUBSCRIPTION_TOKEN = token;
+  F1TV_TOKEN_SOURCE = `playwright:${tokenSource}`;
+  f1TvTokenState.status = "persisted_successfully";
+  scheduleF1TvTokenRefresh(token);
 
-    // Retry immediately with the new token instead of waiting for the next
-    // bridge restart, mirroring how update-token refreshes the F1 connection.
-    await notifyApiToReconnect();
+  if (f1Connection) await refreshF1Connection();
+  console.log("[F1] F1 TV subscription token refreshed and saved.");
+}
 
-    return res.json({
-      success: true,
-      message: "F1T_API_TOKEN actualizado y guardado en .env correctamente.",
-    });
-  },
-);
+async function initializeF1TvAuth(): Promise<void> {
+  if (F1TV_AUTH_MODE === "manual" || f1TvManualOverride) return;
+  if (f1TvAuthInitialized || !hasF1TvAuthSource) return;
+
+  try {
+    await refreshF1TvSubscriptionToken();
+  } catch (error) {
+    if (!F1TV_SUBSCRIPTION_TOKEN) throw error;
+
+    f1TvTokenState.status = "refresh_failed_using_persisted_token";
+    persistTokenStatus("F1TVSUBSCRIPTION_TOKEN_STATUS", f1TvTokenState.status);
+    console.error(
+      "[F1] Automatic login failed; continuing with the existing F1TVSUBSCRIPTION_TOKEN:",
+      error,
+    );
+    scheduleF1TvTokenRefresh(F1TV_SUBSCRIPTION_TOKEN);
+    scheduleF1TvTokenRetry();
+  }
+  f1TvAuthInitialized = true;
+}
 
 /**
  * Tell f1-api-ws to reset its reconnect counter and retry connecting to
@@ -385,7 +1108,9 @@ async function checkUpcomingSessionAndReset(): Promise<void> {
 async function connectToF1(): Promise<void> {
   return new Promise((resolve, reject) => {
     try {
-      console.log("[F1] Creating SignalR connection...");
+      console.log(
+        `[F1] Creating SignalR connection with token fingerprint=${getTokenFingerprint(F1TV_SUBSCRIPTION_TOKEN)} length=${F1TV_SUBSCRIPTION_TOKEN.length} source=${F1TV_TOKEN_SOURCE}.`,
+      );
 
       const connection = new HubConnectionBuilder()
         .withUrl("https://livetiming.formula1.com/signalrcore", {
@@ -411,6 +1136,7 @@ async function connectToF1(): Promise<void> {
 
           // Los datos ya vienen decodificados (JSON objects), no CBOR
           processFeed(feedName, data);
+          sessionRecorder.recordFeed(feedName, data, timestamp, fullState);
 
           // Codifica a CBOR para enviar a los clientes WebSocket
           const messageToClients = {
@@ -480,6 +1206,7 @@ async function connectToF1(): Promise<void> {
                   Object.keys(subscriptionData),
                 );
                 fullState.R = subscriptionData;
+                sessionRecorder.recordInitialState(fullState);
                 // Envía el dump inicial codificado a CBOR, con la misma forma
                 // (sin el wrapper "R") que reciben los clientes nuevos al conectarse.
                 broadcastToClients(encodeCBOR(fullState.R));
@@ -657,6 +1384,9 @@ async function initBridge(): Promise<void> {
   isConnecting = true;
 
   try {
+    await initializeF1ApiAuth();
+    await initializeF1TvAuth();
+
     // Step 1: Start WebSocket server
     if (!wss) {
       await startWebSocketServer();
@@ -678,7 +1408,10 @@ async function initBridge(): Promise<void> {
   } catch (error) {
     console.error("[Bridge] Initialization failed:", error);
     isConnecting = false;
-    setTimeout(initBridge, 10000);
+    setTimeout(
+      initBridge,
+      hasF1TvAuthSource && !F1TV_SUBSCRIPTION_TOKEN ? 300000 : 10000,
+    );
   }
 
   isConnecting = false;

@@ -2,13 +2,6 @@ services:
   f1-bridge:
     env_file:
       - .env
-    environment:
-      BRIDGE_PORT: ${BRIDGE_PORT}
-      F1TVSUBSCRIPTION_TOKEN: ${F1TVSUBSCRIPTION_TOKEN}
-      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
-      NGROK_DOMAIN: ${NGROK_DOMAIN}
-      F1T_API_URL: ${F1T_API_URL}
-      F1T_API_TOKEN: ${F1T_API_TOKEN}
     build:
       context: .
       dockerfile: Dockerfile
@@ -17,5 +10,8 @@ services:
     ports:
       - "5631:5631"
       - "3005:3005"
+    environment:
+      F1_RECORDINGS_DIR: /app/recordings
     volumes:
       - ./.env:/app/.env
+      - ./recordings:/app/recordings
