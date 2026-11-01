@@ -15,6 +15,7 @@ This repository contains the backend for F1 Bridge, which connects WebSocket cli
 - Calls `POST {F1T_API_URL}/admin/bridge/reset-reconnect` after initialization so the API reconnects to the bridge automatically.
 - Automatically records sessions when `SessionStatus` changes to `Started` and closes the file when it changes to `Finalised`. Qualifying is split into Q1/Q2/Q3 files when `SessionData.Series` changes.
 - Saves recordings as JSON Lines (`.jsonl`), compatible with the current replay format, in `recordings/` (persisted in Docker).
+- Filenames use the year, Grand Prix name, session, and Qualifying part when applicable; for example: `2026-mexico-city-grand-prix-qualifying-q1.jsonl`.
 - If the bridge restarts while the session is still `Started`, it resumes appending to the existing file for that session, including the current Qualifying part. The time during the restart cannot be recovered.
 - Uploads each file to F1 Telemetry when it closes, using the API administrator credentials configured in the bridge.
 

@@ -16,6 +16,7 @@ Este repositorio contiene el backend del puente F1 Bridge que conecta a los clie
 - Al terminar de inicializarse, llama a `POST {F1T_API_URL}/admin/bridge/reset-reconnect` para que la API se reconecte automáticamente al bridge.
 - Graba las sesiones automáticamente cuando `SessionStatus` pasa a `Started` y cierra el archivo cuando pasa a `Finalised`. Qualifying se divide en archivos Q1/Q2/Q3 al cambiar `SessionData.Series`.
 - Las grabaciones son JSON Lines (`.jsonl`), compatibles con el formato que consume el replay actual; se guardan en `recordings/` (persistente en Docker).
+- Los nombres usan el año, el nombre del Grand Prix, la sesión y la parte de Qualifying cuando corresponde; por ejemplo: `2026-mexico-city-grand-prix-qualifying-q1.jsonl`.
 - Si el bridge se reinicia mientras la sesión sigue en `Started`, continúa agregando datos al archivo existente de esa sesión (incluyendo la parte actual de Qualifying). El tiempo durante el reinicio no se recupera.
 - Al cerrarse cada archivo, lo sube automáticamente a F1 Telemetry usando las credenciales de administrador de la API configuradas en el bridge.
 
@@ -60,4 +61,3 @@ Opcional (no requerida, tiene default):
 - `NGROK_BIN_PATH`: ruta al ejecutable `ngrok` si no está en el `PATH`. Por defecto usa `ngrok`.
 - `F1TV_SHOW_BROWSER`: `false` por defecto. Solo en Windows local, ponelo en `true` para ver la ventana de Chromium durante el login. En Docker y otros sistemas se ignora y Chromium se mantiene headless.
 - `F1TV_PLAYWRIGHT_EXECUTABLE_PATH`: ruta a un Chromium/Chrome instalado manualmente.
-

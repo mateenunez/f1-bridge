@@ -17,6 +17,7 @@ interface SessionIdentity {
   sessionType: string;
   year: string;
   meetingKey: string;
+  meetingName: string;
   sessionPath: string;
   name: string;
   sessionName: string;
@@ -111,6 +112,7 @@ export class SessionRecorder {
     const meeting = sessionInfo.Meeting ?? {};
     const sessionPath = String(sessionInfo.Path ?? "");
     const meetingKey = String(meeting.Key ?? "");
+    const meetingName = String(meeting.Name ?? "");
     const sessionName = String(sessionInfo.Name ?? "");
     const sessionType = String(sessionInfo.Type ?? "");
     const name = sessionName || sessionType || "session";
@@ -131,6 +133,7 @@ export class SessionRecorder {
           : new Date().getFullYear(),
       ),
       meetingKey,
+      meetingName,
       sessionPath,
       name,
       sessionName,
@@ -200,13 +203,14 @@ export class SessionRecorder {
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, "-")
         .replace(/^-|-$/g, "");
-    const sessionId = identity.meetingKey || safeName(identity.sessionPath);
-    const pathSlug = safeName(identity.sessionPath);
+    const meetingSlug =
+      safeName(identity.meetingName) ||
+      safeName(identity.meetingKey) ||
+      "event";
     const baseName = [
       identity.year,
-      sessionId,
+      meetingSlug,
       safeName(identity.name),
-      pathSlug,
       qualifyingPart ? `q${qualifyingPart}` : "",
     ]
       .filter(Boolean)
