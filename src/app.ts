@@ -24,6 +24,7 @@ import {
   SessionRecorder,
   type RecordingMetadata,
 } from "./session-recorder.js";
+import { buildRecordingUploadParams } from "./recording-upload.js";
 
 // The mounted .env file is the source of truth for persisted tokens.
 dotenv.config({ override: true });
@@ -759,10 +760,7 @@ async function uploadClosedRecording(
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       await axios.put(uploadUrl, fs.createReadStream(filePath), {
-        params: {
-          sessionName: metadata.sessionName ?? undefined,
-          sessionType: metadata.sessionType ?? undefined,
-        },
+        params: buildRecordingUploadParams(metadata),
         headers: {
           Authorization: `Bearer ${F1T_API_TOKEN}`,
           "Content-Type": "application/x-ndjson",

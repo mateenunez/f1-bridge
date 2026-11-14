@@ -6,21 +6,75 @@ interface SessionSnapshot {
   R: Record<string, any>;
 }
 
+export interface RecordingMeetingMetadata {
+  key: number | null;
+  name: string | null;
+  officialName: string | null;
+  location: string | null;
+  countryKey: number | null;
+  countryCode: string | null;
+  countryName: string | null;
+  circuitKey: number | null;
+  circuitShortName: string | null;
+}
+
+export interface RecordingSessionMetadata {
+  key: number | null;
+  name: string | null;
+  type: string | null;
+  startDate: string | null;
+  endDate: string | null;
+  qualifyingPart: number | null;
+}
+
 export interface RecordingMetadata {
-  sessionName: string | null;
-  sessionType: string | null;
+  meeting: RecordingMeetingMetadata;
+  session: RecordingSessionMetadata;
 }
 
 interface SessionIdentity {
   key: string;
   type: string;
-  sessionType: string;
   year: string;
   meetingKey: string;
   meetingName: string;
-  sessionPath: string;
   name: string;
-  sessionName: string;
+  meeting: RecordingMeetingMetadata;
+  session: Omit<RecordingSessionMetadata, "qualifyingPart">;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function toText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function toInteger(value: unknown): number | null {
+  if (typeof value === "number" && Number.isSafeInteger(value)) return value;
+  if (typeof value === "string" && /^-?\d+$/.test(value.trim())) {
+    const parsed = Number(value.trim());
+    return Number.isSafeInteger(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function toPositiveInteger(value: unknown): number | null {
+  const parsed = toInteger(value);
+  return parsed !== null && parsed > 0 ? parsed : null;
+}
+
+function parseSessionDate(value: string | null): Date | null {
+  if (!value) return null;
+  const withZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value)
+    ? value
+    : `${value}Z`;
+  const parsed = new Date(withZone);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
 export class SessionRecorder {
@@ -108,35 +162,58 @@ export class SessionRecorder {
   }
 
   private getIdentity(state: SessionSnapshot): SessionIdentity {
-    const sessionInfo = state.R.SessionInfo ?? {};
-    const meeting = sessionInfo.Meeting ?? {};
-    const sessionPath = String(sessionInfo.Path ?? "");
-    const meetingKey = String(meeting.Key ?? "");
-    const meetingName = String(meeting.Name ?? "");
-    const sessionName = String(sessionInfo.Name ?? "");
-    const sessionType = String(sessionInfo.Type ?? "");
-    const name = sessionName || sessionType || "session";
-    const type = (sessionType || name).toLowerCase();
-    const fallbackKey = [
-      meetingKey,
-      sessionInfo.StartDate ?? "",
-      name,
-    ].join("-");
+    const root = asRecord(state.R);
+    const sessionInfo = asRecord(root?.SessionInfo);
+    const meetingNode = asRecord(sessionInfo?.Meeting);
+    const countryNode = asRecord(meetingNode?.Country);
+    const circuitNode = asRecord(meetingNode?.Circuit);
+
+    const rawSessionName = toText(sessionInfo?.Name) ?? "";
+    const rawSessionType = toText(sessionInfo?.Type) ?? "";
+    const startDate = toText(sessionInfo?.StartDate);
+    const endDate = toText(sessionInfo?.EndDate);
+    const name = rawSessionName || rawSessionType || "session";
+    const type = (rawSessionType || name).toLowerCase();
+    const meetingKey = toPositiveInteger(meetingNode?.Key);
+    const meetingName = toText(meetingNode?.Name) ?? "";
+    const start = parseSessionDate(startDate);
+    const sessionName = rawSessionName || rawSessionType || "Session";
+    const sessionType = rawSessionType || sessionName;
+    const sessionKeyValue = toPositiveInteger(sessionInfo?.Key);
+
+    const meeting: RecordingMeetingMetadata = {
+      key: meetingKey,
+      name: meetingName || (meetingKey !== null ? `Meeting ${meetingKey}` : null),
+      officialName: toText(meetingNode?.OfficialName),
+      location: toText(meetingNode?.Location),
+      countryKey: toPositiveInteger(countryNode?.Key),
+      countryCode: toText(countryNode?.Code),
+      countryName: toText(countryNode?.Name),
+      circuitKey: toPositiveInteger(circuitNode?.Key),
+      circuitShortName: toText(circuitNode?.ShortName),
+    };
+    const session: Omit<RecordingSessionMetadata, "qualifyingPart"> = {
+      key: toPositiveInteger(sessionInfo?.Key),
+      name: sessionName,
+      type: sessionType,
+      startDate,
+      endDate,
+    };
 
     return {
-      key: sessionPath || fallbackKey,
+      key:
+        sessionKeyValue !== null
+          ? String(sessionKeyValue)
+          : [meetingKey ?? "", startDate ?? "", name].join("-"),
       type,
-      sessionType,
       year: String(
-        sessionInfo.StartDate
-          ? new Date(sessionInfo.StartDate).getFullYear()
-          : new Date().getFullYear(),
+        start ? start.getUTCFullYear() : new Date().getUTCFullYear(),
       ),
-      meetingKey,
+      meetingKey: meetingKey !== null ? String(meetingKey) : "",
       meetingName,
-      sessionPath,
       name,
-      sessionName,
+      meeting,
+      session,
     };
   }
 
@@ -276,8 +353,11 @@ export class SessionRecorder {
         if (!this.onFileClosed) return;
         Promise.resolve(
           this.onFileClosed(filePath, {
-            sessionName: identity.sessionName || null,
-            sessionType: identity.sessionType || null,
+            meeting: identity.meeting,
+            session: {
+              ...identity.session,
+              qualifyingPart,
+            },
           }),
         ).catch((error) => {
           console.error(`[Recorder] Failed to upload ${filePath}:`, error);
